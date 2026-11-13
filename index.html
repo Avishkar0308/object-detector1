@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Live Object Detector</title>
+<style>
+  :root { --bg:#0b0d12; --card:#151922; --line:#262c3a; --text:#e8ecf4; --mute:#8b94a7; --acc:#5eead4; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--text); font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  body { min-height:100vh; padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)); display:flex; justify-content:center; }
+  .wrap { width:100%; max-width:980px; }
+  h1 { font-size:1.4rem; margin:4px 0 2px; }
+  .sub { color:var(--mute); font-size:.9rem; margin-bottom:14px; }
+  .stage { position:relative; background:#000; border:1px solid var(--line); border-radius:16px; overflow:hidden; min-height:220px; }
+  canvas#view { display:block; width:100%; height:auto; }
+  #video { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+  .overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; text-align:center; padding:20px; background:rgba(11,13,18,.82); }
+  .overlay.hidden { display:none; }
+  .hud { position:absolute; top:10px; left:10px; background:rgba(0,0,0,.6); padding:4px 10px; border-radius:999px; font-size:.78rem; color:var(--acc); font-variant-numeric:tabular-nums; }
+  .controls { display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; align-items:center; }
+  button, select, .filebtn { background:var(--card); color:var(--text); border:1px solid var(--line); border-radius:12px; padding:11px 16px; font-size:.95rem; cursor:pointer; font-family:inherit; }
+  button.primary { background:var(--acc); color:#06231f; border-color:var(--acc); font-weight:600; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .filebtn input { display:none; }
+  label.slider { display:flex; align-items:center; gap:8px; color:var(--mute); font-size:.85rem; }
+  input[type=range] { accent-color: var(--acc); }
+  .bar { width:min(320px,80%); height:8px; background:var(--line); border-radius:99px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0%; background:var(--acc); transition:width .2s; }
+  .msg { max-width:520px; line-height:1.45; }
+  .warn { background:#3a2a10; border:1px solid #6b4a14; color:#ffd58a; padding:10px 14px; border-radius:12px; margin-bottom:12px; font-size:.88rem; display:none; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:12px; min-height:30px; }
+  .chip { font-size:.8rem; padding:4px 10px; border-radius:999px; border:1px solid var(--line); background:var(--card); }
+  footer { color:var(--mute); font-size:.78rem; margin-top:18px; text-align:center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Live Object Detector</h1>
+  <div class="sub">Real neural network running 100% in your browser. Your camera feed never leaves your device.</div>
+
+  <div id="warn" class="warn"></div>
+
+  <div class="stage">
+    <canvas id="view" width="640" height="480"></canvas>
+    <video id="video" playsinline muted autoplay></video>
+    <div class="hud" id="hud">idle</div>
+    <div class="overlay" id="overlay">
+      <div class="msg" id="overlayMsg">Load the AI model, then start your camera.</div>
+      <div class="bar" id="barWrap" style="display:none"><i id="bar"></i></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="startBtn">Start camera</button>
+    <button id="flipBtn" disabled>Flip camera</button>
+    <button id="stopBtn" disabled>Stop</button>
+    <label class="filebtn">Use a photo instead<input type="file" id="file" accept="image/*"></label>
+  </div>
+
+  <div class="controls">
+    <select id="model">
+      <option value="Xenova/yolos-tiny">YOLOS-tiny (fast, light)</option>
+      <option value="Xenova/detr-resnet-50">DETR ResNet-50 (accurate, heavy)</option>
+    </select>
+    <label class="slider">Confidence <input type="range" id="thr" min="0.2" max="0.95" step="0.05" value="0.5"><span id="thrVal">0.50</span></label>
+  </div>
+
+  <div class="chips" id="chips"></div>
+  <footer>Powered by Transformers.js · models from Hugging Face · hosted on GitHub Pages</footer>
+</div>
+
+<script type="module">
+import { pipeline, RawImage, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3";
+
+const $ = (id) => document.getElementById(id);
+const view = $("view"), ctx = view.getContext("2d");
+const video = $("video");
+const work = document.createElement("canvas"), wctx = work.getContext("2d", { willReadFrequently: true });
+
+let detector = null, loadedModel = null, loading = false;
+let stream = null, facing = "environment";
+let source = null;            // HTMLVideoElement or HTMLImageElement being displayed
+let sourceKind = null;        // "video" | "image"
+let mirrored = false;
+let dets = [], running = false, lastFps = 0;
+let detSeq = 0;               // bumps whenever the source changes, so stale results are dropped
+
+// ---------- helpers ----------
+const warn = (t) => { const w = $("warn"); w.textContent = t; w.style.display = t ? "block" : "none"; };
+const setOverlay = (msg, showBar = false) => {
+  $("overlay").classList.toggle("hidden", !msg);
+  $("overlayMsg").textContent = msg || "";
+  $("barWrap").style.display = showBar ? "block" : "none";
+};
+const colorFor = (label) => {
+  let h = 0; for (const c of label) h = (h * 31 + c.charCodeAt(0)) % 360;
+  return `hsl(${h} 90% 60%)`;
+};
+
+// In-app browsers (Instagram, Facebook, LinkedIn, etc.) often block the camera.
+(function checkEnv() {
+  const ua = navigator.userAgent || "";
+  if (/FBAN|FBAV|Instagram|Line\/|MicroMessenger|LinkedInApp|Snapchat|TikTok|Twitter/i.test(ua)) {
+    warn("You're inside an in-app browser, which often blocks the camera. Open this link in Chrome or Safari for best results.");
+  }
+  if (!window.isSecureContext) {
+    warn("The camera needs a secure (https) page. Open this site using its https:// address.");
+  }
+})();
+
+// ---------- model ----------
+async function loadModel() {
+  const name = $("model").value;
+  if (detector && loadedModel === name) return true;
+  if (loading) return false;
+  loading = true;
+  detector = null;
+  setOverlay("Downloading AI model (first time only)…", true);
+  $("bar").style.width = "0%";
+
+  const progress_callback = (p) => {
+    if (p.status === "progress" && typeof p.progress === "number") {
+      $("bar").style.width = p.progress.toFixed(0) + "%";
+    }
+  };
+  const tryLoad = (device) => pipeline("object-detection", name, { device, progress_callback });
+
+  try {
+    try {
+      detector = await tryLoad(navigator.gpu ? "webgpu" : "wasm");
+    } catch (e) {
+      console.warn("Primary backend failed, falling back to WASM", e);
+      detector = await tryLoad("wasm");
+    }
+    loadedModel = name;
+    return true;
+  } catch (e) {
+    console.error(e);
+    setOverlay("Couldn't load the model. Check your internet connection and try again.");
+    return false;
+  } finally {
+    loading = false;
+  }
+}
+
+// ---------- camera ----------
+function cameraErrorMessage(e) {
+  switch (e && e.name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return "Camera permission was blocked. Allow camera access for this site in your browser settings, then tap Start again.";
+    case "NotFoundError":
+    case "DevicesNotFoundError":
+      return "No camera was found on this device. You can still use “Use a photo instead”.";
+    case "NotReadableError":
+    case "TrackStartError":
+      return "Your camera is being used by another app. Close it and try again.";
+    case "OverconstrainedError":
+      return "This camera doesn't support the requested mode. Try Flip camera.";
+    default:
+      return "Couldn't start the camera (" + ((e && e.name) || "unknown error") + "). You can still use “Use a photo instead”.";
+  }
+}
+
+async function getStream() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    const err = new Error("no mediaDevices"); err.name = "SecurityError"; throw err;
+  }
+  // Try progressively simpler constraints so it works on every device.
+  const attempts = [
+    { video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false },
+    { video: { facingMode: { ideal: facing } }, audio: false },
+    { video: true, audio: false },
+  ];
+  let lastErr;
+  for (const c of attempts) {
+    try { return await navigator.mediaDevices.getUserMedia(c); }
+    catch (e) {
+      lastErr = e;
+      if (e.name === "NotAllowedError" || e.name === "SecurityError") break; // retrying won't help
+    }
+  }
+  throw lastErr;
+}
+
+function stopStream() {
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  video.srcObject = null;
+}
+
+async function startCamera() {
+  const ok = await loadModel();
+  if (!ok) return;
+  setOverlay("Starting camera…");
+  stopStream();
+  try {
+    stream = await getStream();
+  } catch (e) {
+    console.error(e);
+    setOverlay(cameraErrorMessage(e));
+    return;
+  }
+  const track = stream.getVideoTracks()[0];
+  const settings = (track && track.getSettings && track.getSettings()) || {};
+  // Front cameras should look like a mirror. If unknown, mirror only when we asked for "user".
+  mirrored = settings.facingMode ? settings.facingMode === "user" : facing === "user";
+
+  video.srcObject = stream;
+  video.muted = true;
+  video.setAttribute("playsinline", "");
+  try { await video.play(); } catch (e) { console.warn("play() rejected", e); }
+
+  // Wait until we really have frames (some mobile browsers report 0x0 for a moment).
+  const t0 = performance.now();
+  while ((!video.videoWidth || video.readyState < 2) && performance.now() - t0 < 5000) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (!video.videoWidth) { setOverlay("The camera started but produced no video. Try Flip camera or reload the page."); return; }
+
+  track.addEventListener("ended", () => { setOverlay("Camera disconnected."); setButtons(false); });
+
+  source = video; sourceKind = "video"; detSeq++; dets = [];
+  setOverlay("");
+  setButtons(true);
+  startLoops();
+}
+
+function setButtons(camOn) {
+  $("flipBtn").disabled = !camOn;
+  $("stopBtn").disabled = !camOn;
+  $("startBtn").textContent = camOn ? "Restart camera" : "Start camera";
+}
+
+function stopAll() {
+  running = false; detSeq++;
+  stopStream();
+  source = null; sourceKind = null; dets = [];
+  setButtons(false);
+  $("chips").innerHTML = "";
+  $("hud").textContent = "idle";
+  setOverlay("Camera stopped. Tap Start camera to begin again.");
+}
+
+// ---------- photo fallback ----------
+$("file").addEventListener("change", async (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  const ok = await loadModel();
+  if (!ok) return;
+  stopStream();
+  const img = new Image();
+  img.onload = () => {
+    URL.revokeObjectURL(img.src);
+    source = img; sourceKind = "image"; mirrored = false; detSeq++; dets = [];
+    setOverlay(""); setButtons(false); $("stopBtn").disabled = false;
+    startLoops();
+  };
+  img.onerror = () => setOverlay("That image couldn't be opened. Try a JPG or PNG.");
+  img.src = URL.createObjectURL(f);
+  ev.target.value = "";
+});
+
+// ---------- loops ----------
+function srcSize() {
+  return sourceKind === "video"
+    ? [video.videoWidth, video.videoHeight]
+    : [source.naturalWidth, source.naturalHeight];
+}
+
+function startLoops() {
+  if (running) return;
+  running = true;
+  renderLoop();
+  detectLoop();
+}
+
+function renderLoop() {
+  if (!running) return;
+  if (source) {
+    const [sw, sh] = srcSize();
+    if (sw && sh) {
+      const W = Math.min(sw, 960), H = Math.round((sh * W) / sw);
+      if (view.width !== W || view.height !== H) { view.width = W; view.height = H; }
+      ctx.save();
+      if (mirrored) { ctx.translate(W, 0); ctx.scale(-1, 1); }
+      ctx.drawImage(source, 0, 0, W, H);
+      ctx.restore();
+      drawBoxes(W, H);
+    }
+  }
+  requestAnimationFrame(renderLoop);
+}
+
+function drawBoxes(W, H) {
+  const lw = Math.max(2, Math.round(W / 320));
+  const fs = Math.max(12, Math.round(W / 46));
+  ctx.lineWidth = lw; ctx.font = `600 ${fs}px system-ui, sans-serif`; ctx.textBaseline = "top";
+  for (const d of dets) {
+    let x = d.x * W, y = d.y * H, w = d.w * W, h = d.h * H;
+    if (mirrored) x = W - x - w;
+    const col = colorFor(d.label);
+    ctx.strokeStyle = col; ctx.strokeRect(x, y, w, h);
+    const text = `${d.label} ${(d.score * 100).toFixed(0)}%`;
+    const tw = ctx.measureText(text).width + 10, th = fs + 6;
+    const ty = y - th < 0 ? y : y - th;
+    ctx.fillStyle = col; ctx.fillRect(x, ty, tw, th);
+    ctx.fillStyle = "#000"; ctx.fillText(text, x + 5, ty + 3);
+  }
+}
+
+async function detectLoop() {
+  let frames = 0, t0 = performance.now();
+  while (running) {
+    if (!source || !detector) { await new Promise((r) => setTimeout(r, 100)); continue; }
+    const [sw, sh] = srcSize();
+    if (!sw || !sh || (sourceKind === "video" && video.readyState < 2)) { await new Promise((r) => setTimeout(r, 60)); continue; }
+
+    const seq = detSeq;
+    const scale = Math.min(1, 480 / Math.max(sw, sh));   // small input = fast on phones
+    const w = Math.round(sw * scale), h = Math.round(sh * scale);
+    work.width = w; work.height = h;
+    wctx.drawImage(source, 0, 0, w, h);
+
+    try {
+      const out = await detector(RawImage.fromCanvas(work), { threshold: parseFloat($("thr").value) });
+      if (seq === detSeq) {
+        dets = out.map((o) => ({
+          label: o.label, score: o.score,
+          x: o.box.xmin / w, y: o.box.ymin / h,
+          w: (o.box.xmax - o.box.xmin) / w, h: (o.box.ymax - o.box.ymin) / h,
+        }));
+        updateChips();
+      }
+    } catch (e) {
+      console.error(e);
+      $("hud").textContent = "detection error";
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    frames++;
+    const now = performance.now();
+    if (now - t0 >= 1000) { lastFps = (frames * 1000) / (now - t0); frames = 0; t0 = now; }
+    $("hud").textContent = `${dets.length} object${dets.length === 1 ? "" : "s"} · ${lastFps.toFixed(1)} FPS`;
+
+    if (sourceKind === "image") { await new Promise((r) => setTimeout(r, 400)); } // no need to spin on a still photo
+    else await new Promise((r) => setTimeout(r, 0));
+  }
+}
+
+function updateChips() {
+  const counts = {};
+  for (const d of dets) counts[d.label] = (counts[d.label] || 0) + 1;
+  $("chips").innerHTML = Object.entries(counts)
+    .map(([l, n]) => `<span class="chip" style="border-color:${colorFor(l)}">${l} × ${n}</span>`).join("");
+}
+
+// ---------- UI ----------
+$("startBtn").addEventListener("click", startCamera);
+$("stopBtn").addEventListener("click", stopAll);
+$("flipBtn").addEventListener("click", () => { facing = facing === "user" ? "environment" : "user"; startCamera(); });
+$("thr").addEventListener("input", (e) => { $("thrVal").textContent = parseFloat(e.target.value).toFixed(2); });
+$("model").addEventListener("change", async () => {
+  const was = running;
+  detector = null; dets = [];
+  if (was) { const ok = await loadModel(); if (ok) setOverlay(""); }
+});
+
+// Pause work when the tab is hidden (saves battery), resume when back.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { running = false; }
+  else if (source) { startLoops(); }
+});
+
+// Default to the front camera on laptops/desktops (they have no rear camera).
+if (!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) facing = "user";
+</script>
+</body>
+</html>
